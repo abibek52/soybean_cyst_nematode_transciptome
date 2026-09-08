@@ -1,0 +1,727 @@
+****************************Codes/Scripts used in the study*******************************
+******************************************************************************************
+1. Downloading archived RNA-Seq data (SRR) using NCBI SRA Toolkit
+
+#!/bin/bash
+while read -r acc; do
+    [ -n "$acc" ] && fasterq-dump --split-files "$acc"
+done < accessions.txt
+******************************************************************************************
+
+2. Quality control of raw data using FastQC and MultiQC
+
+#!/bin/bash
+module load fastqc
+fastqc SRR*.fastq	#run all SRR
+module load multiqc
+multiqc .		# all SRR files
+******************************************************************************************
+
+3. Btrim64 to trim low-quality bases
+
+(bash)
+btrim64 -q -t /path/to/file/SRR*.fastq -o /path/for/output/file/SRR*_trimmed.fastq #trimming a read
+******************************************************************************************
+
+4. Salmon indexing and quantification
+
+#!/bin/bash
+#SBATCH --job-name=scn_transcipt_index   # Name of the job in the SLURM queue
+#SBATCH --partition=bigmem          # Cluster partition with high-memory nodes
+#SBATCH --cpus-per-task=48          # Number of CPU cores allocated for threading
+#SBATCH --mem=500G                  # Total RAM allocated (500 Gigabytes)
+#SBATCH --time=72:00:00             # Time limit (72 hours) before job termination
+#SBATCH --output=scn_%j.log     # Captures stdout (standard output) with Job ID (%j)
+
+# Load the salmon environment on your cluster
+conda activate environment_name
+
+#Salmon indexing
+salmon index --transcripts heterodera_glycines.PRJNA381081.WBPS17.mRNA_transcripts.fa --index scn_index  -k 31
+
+#salmon quantification
+salmon quant -i scn-index -l A -1 *.fasta -2 *_trimmed.fasta -o *_count --validateMappings #for all at once RNASeq
+******************************************************************************************
+
+5. Differential Gene Expression Analysis
+
+(R)
+suppressMessages({
+  library(txdbmaker)
+  library(GenomicFeatures)
+  library(AnnotationDbi)
+  library(tximport)
+  library(DESeq2)
+  library(ggplot2)
+  library(pheatmap)
+  library(RColorBrewer)
+  library(VennDiagram)
+  library(dplyr)
+  library(tidyr)
+  library(grid)
+  library(gridExtra)
+})
+
+# Silence verbose VennDiagram logger output
+futile.logger::flog.threshold(futile.logger::ERROR, name = "VennDiagramLogger")
+
+## -----------------------------------------------------------------
+## 0. PATHS & GLOBAL PARAMETERS
+## -----------------------------------------------------------------
+BASE_DIR <- "/path/to/file"
+GFF_FILE <- file.path(BASE_DIR, "heterodera_glycines.PRJNA381081.WBPS19.annotations.gff3/heterodera_glycines.PRJNA381081.WBPS19.annotations.gff3")
+META_CSV <- file.path(BASE_DIR, "Time-Treatment-all.csv")
+
+OUT_DIR <- "."
+dir.create(file.path(OUT_DIR, "results"), showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(OUT_DIR, "figures"), showWarnings = FALSE, recursive = TRUE)
+
+LFC_T  <- 2     # |log2FoldChange| threshold
+PADJ_T <- 0.05  # BH-adjusted p-value threshold
+
+## -----------------------------------------------------------------
+## 1. EXTRACT TX2GENE FROM GFF3
+## -----------------------------------------------------------------
+cat("Building TxDb from GFF3...\n")
+txdb <- makeTxDbFromGFF(GFF_FILE, format = "gff3")
+
+k <- keys(txdb, keytype = "TXNAME")
+tx2gene <- AnnotationDbi::select(txdb, keys = k, columns = "GENEID", keytype = "TXNAME")
+
+## -----------------------------------------------------------------
+## 2. LOAD METADATA & MAP SALMON DIRECTORIES
+## -----------------------------------------------------------------
+meta_raw <- read.csv(META_CSV, row.names = 1, check.names = FALSE)
+meta <- as.data.frame(t(meta_raw))
+
+meta$days      <- as.character(meta$days)
+meta$replicate <- as.character(meta$replicate)
+
+# Drop outlier sample ST16 if present
+meta <- meta[!grepl("^ST16", rownames(meta)), ]
+
+sample_dirs <- list.dirs(BASE_DIR, full.names = FALSE, recursive = FALSE)
+sample_dirs <- grep("_count$", sample_dirs, value = TRUE)
+sample_dirs <- sample_dirs[!grepl("^ST16", sample_dirs)]
+raw_accessions <- gsub("_count$", "", sample_dirs)
+
+files <- file.path(BASE_DIR, sample_dirs, "quant.sf")
+names(files) <- raw_accessions
+stopifnot(all(file.exists(files)))
+
+common_samples <- intersect(names(files), rownames(meta))
+files <- files[common_samples]
+meta  <- meta[common_samples, ]
+
+# Rename sample identities to experimental condition labels
+new_names <- meta$Rename
+names(files) <- new_names
+rownames(meta) <- new_names
+stopifnot(all(names(files) == rownames(meta)))
+
+# Factors setup
+meta$genotype  <- factor(meta$genotype,  levels = c("S", "R"))
+meta$treatment <- factor(meta$treatment, levels = c("Cntrl", "SCN", "SCN+SBA"))
+meta$days      <- factor(meta$days,      levels = c("5", "30"))
+meta$group     <- factor(paste(meta$genotype,
+                               gsub("\\+", "_", meta$treatment),
+                               meta$days, sep = "_"))
+
+## -----------------------------------------------------------------
+## 3. IMPORT QUANTIFICATIONS VIA TXIMPORT
+## -----------------------------------------------------------------
+cat("Importing transcript quantifications to gene level...\n")
+txi <- tximport(
+  files           = files,
+  type            = "salmon",
+  tx2gene         = tx2gene,
+  ignoreTxVersion = FALSE
+)
+
+## -----------------------------------------------------------------
+## 4. DESeq2 MODEL 1: ~group (Pairwise Contrasts)
+## -----------------------------------------------------------------
+dds <- DESeqDataSetFromTximport(txi = txi, colData = meta, design = ~ group)
+keep <- rowSums(counts(dds)) >= 10
+dds  <- dds[keep, ]
+dds  <- DESeq(dds)
+
+run_contrast <- function(dds_obj, g1, g2, name) {
+  res <- results(dds_obj, contrast = c("group", g1, g2), alpha = PADJ_T)
+  res <- as.data.frame(res)
+  res <- res[order(res$padj), ]
+  sig <- res[!is.na(res$padj) & res$padj < PADJ_T & abs(res$log2FoldChange) > LFC_T, ]
+  
+  write.csv(res, file.path(OUT_DIR, sprintf("results/DEG_%s_full.csv", name)))
+  write.csv(sig, file.path(OUT_DIR, sprintf("results/DEG_%s_sig.csv", name)))
+  cat(sprintf("[Model 1] %-22s: %d sig DEGs\n", name, nrow(sig)))
+  nrow(sig)
+}
+
+comparisons <- list(
+  c("S_SCN_5",      "S_SCN_30",     "S_SCN_5vs30"),
+  c("S_SCN_5",      "S_SCN_SBA_5",  "S_SCNvsSCN+SBA_5"),
+  c("S_SCN_30",     "S_SCN_SBA_30", "S_SCNvsSCN+SBA_30"),
+  c("S_SCN_SBA_5",  "S_SCN_SBA_30", "S_SCN+SBA_5vs30"),
+  c("R_SCN_5",      "R_SCN_30",     "R_SCN_5vs30"),
+  c("R_SCN_5",      "R_SCN_SBA_5",  "R_SCNvsSCN+SBA_5"),
+  c("R_SCN_30",     "R_SCN_SBA_30", "R_SCNvsSCN+SBA_30"),
+  c("R_SCN_SBA_5",  "R_SCN_SBA_30", "R_SCN+SBA_5vs30")
+)
+
+summary_tab <- do.call(rbind, lapply(comparisons, function(cc) {
+  n <- run_contrast(dds, cc[1], cc[2], cc[3])
+  data.frame(comparison = cc[3], group1 = cc[1], group2 = cc[2], n_sig_DEGs = n)
+}))
+write.csv(summary_tab, file.path(OUT_DIR, "results/summary_group_comparisons.csv"), row.names = FALSE)
+
+## -----------------------------------------------------------------
+## 5. DESeq2 MODEL 2: ~treatment * genotype (Active Treatments Only)
+## -----------------------------------------------------------------
+summary_list <- list()
+
+for (day in c("5", "30")) {
+  sub_meta  <- meta[meta$days == day, ]
+  sub_files <- files[rownames(sub_meta)]
+  
+  sub_txi <- tximport(sub_files, type = "salmon", tx2gene = tx2gene, ignoreTxVersion = FALSE)
+  
+  sub_meta$treatment <- factor(sub_meta$treatment, levels = c("Cntrl", "SCN", "SCN+SBA"))
+  sub_meta$genotype  <- factor(sub_meta$genotype,  levels = c("S", "R"))
+  
+  dds_d <- DESeqDataSetFromTximport(
+    txi     = sub_txi,
+    colData = sub_meta,
+    design  = ~ treatment * genotype
+  )
+  
+  keep_d <- rowSums(counts(dds_d)) >= 10
+  dds_d  <- dds_d[keep_d, ]
+  dds_d  <- DESeq(dds_d)
+  
+  coef_names  <- resultsNames(dds_d)
+  int_scn     <- grep("treatment.*SCN.*genotype.*R", coef_names, value = TRUE)
+  int_scn_sba <- grep("treatment.*SCN.*SBA.*genotype.*R", coef_names, value = TRUE)
+  
+  # Only evaluate active treatments: SCN and SCN+SBA (Cntrl excluded)
+  day_contrasts <- list(
+    list(name = sprintf("RvsS_SCN_%sdpi", day),     contrast = list(c("genotype_R_vs_S", int_scn)),     desc = "SCN"),
+    list(name = sprintf("RvsS_SCN+SBA_%sdpi", day), contrast = list(c("genotype_R_vs_S", int_scn_sba)), desc = "SCN+SBA")
+  )
+  
+  for (item in day_contrasts) {
+    res <- results(dds_d, contrast = item$contrast, alpha = PADJ_T)
+    res <- as.data.frame(res)
+    res <- res[order(res$padj), ]
+    sig <- res[!is.na(res$padj) & res$padj < PADJ_T & abs(res$log2FoldChange) > LFC_T, ]
+    
+    write.csv(res, file.path(OUT_DIR, sprintf("results/DEG_%s_full.csv", item$name)))
+    write.csv(sig, file.path(OUT_DIR, sprintf("results/DEG_%s_sig.csv", item$name)))
+    
+    cat(sprintf("[Model 2] %-22s (%s %sdpi): %d sig DEGs\n", item$name, item$desc, day, nrow(sig)))
+    
+    summary_list[[item$name]] <- data.frame(
+      comparison = item$name,
+      day        = day,
+      treatment  = item$desc,
+      n_sig_DEGs = nrow(sig)
+    )
+  }
+}
+
+summary_genotype_df <- do.call(rbind, summary_list)
+write.csv(summary_genotype_df, file.path(OUT_DIR, "results/summary_genotype_comparisons.csv"), row.names = FALSE)
+
+
+## -----------------------------------------------------------------
+## 6. MA & VOLCANO PLOTS
+## -----------------------------------------------------------------
+names_vec <- c(
+  "S_SCN_5vs30", "S_SCNvsSCN+SBA_5", "S_SCNvsSCN+SBA_30", "S_SCN+SBA_5vs30",
+  "R_SCN_5vs30", "R_SCNvsSCN+SBA_5", "R_SCNvsSCN+SBA_30", "R_SCN+SBA_5vs30",
+  "RvsS_SCN_5dpi", "RvsS_SCN_30dpi", "RvsS_SCN+SBA_5dpi", "RvsS_SCN+SBA_30dpi"
+)
+
+titles <- c(
+  "S_SCN_5vs30"        = "S: SCN (5 vs 30 dpi)",
+  "S_SCNvsSCN+SBA_5"   = "S: SCN vs SCN+SBA (5 dpi)",
+  "S_SCNvsSCN+SBA_30"  = "S: SCN vs SCN+SBA (30 dpi)",
+  "S_SCN+SBA_5vs30"    = "S: SCN+SBA (5 vs 30 dpi)",
+  "R_SCN_5vs30"        = "R: SCN (5 vs 30 dpi)",
+  "R_SCNvsSCN+SBA_5"   = "R: SCN vs SCN+SBA (5 dpi)",
+  "R_SCNvsSCN+SBA_30"  = "R: SCN vs SCN+SBA (30 dpi)",
+  "R_SCN+SBA_5vs30"    = "R: SCN+SBA (5 vs 30 dpi)",
+  "RvsS_SCN_5dpi"      = "R vs S: SCN (5 dpi)",
+  "RvsS_SCN_30dpi"     = "R vs S: SCN (30 dpi)",
+  "RvsS_SCN+SBA_5dpi"  = "R vs S: SCN+SBA (5 dpi)",
+  "RvsS_SCN+SBA_30dpi" = "R vs S: SCN+SBA (30 dpi)"
+)
+
+theme_pub <- theme_bw(base_size = 11) +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(linewidth = 0.2),
+        plot.title       = element_text(size = 10, hjust = 0.5))
+
+col_map <- c("NS" = "grey70", "Down" = "#1f77b4", "Up" = "#d62728")
+
+classify <- function(res) {
+  res$sig <- "NS"
+  res$sig[!is.na(res$padj) & res$padj < PADJ_T & res$log2FoldChange >  LFC_T] <- "Up"
+  res$sig[!is.na(res$padj) & res$padj < PADJ_T & res$log2FoldChange < -LFC_T] <- "Down"
+  res$sig <- factor(res$sig, levels = c("NS", "Down", "Up"))
+  res
+}
+
+for (n in names_vec) {
+  res_file <- file.path(OUT_DIR, sprintf("results/DEG_%s_full.csv", n))
+  if (!file.exists(res_file)) next
+  
+  res <- read.csv(res_file, row.names = 1)
+  res <- classify(res)
+  n_up   <- sum(res$sig == "Up")
+  n_down <- sum(res$sig == "Down")
+  
+  p_ma <- ggplot(res, aes(x = log10(baseMean + 1), y = log2FoldChange, color = sig)) +
+    geom_point(size = 0.6, alpha = 0.6) +
+    geom_hline(yintercept = 0, color = "black", linewidth = 0.4) +
+    geom_hline(yintercept = c(-LFC_T, LFC_T), linetype = "dashed", linewidth = 0.3) +
+    scale_color_manual(values = col_map,
+                       labels = c("NS", sprintf("Down (%d)", n_down), sprintf("Up (%d)", n_up))) +
+    labs(title = titles[[n]], x = "log10(mean expression + 1)", y = "log2 fold change", color = NULL) +
+    theme_pub
+  ggsave(file.path(OUT_DIR, sprintf("figures/MA_%s.png", n)), p_ma, width = 4.5, height = 4, dpi = 300)
+  
+  res_v <- res[!is.na(res$padj), ]
+  p_v <- ggplot(res_v, aes(x = log2FoldChange, y = -log10(padj), color = sig)) +
+    geom_point(size = 0.6, alpha = 0.6) +
+    geom_vline(xintercept = c(-LFC_T, LFC_T), linetype = "dashed", linewidth = 0.3) +
+    geom_hline(yintercept = -log10(PADJ_T), linetype = "dashed", linewidth = 0.3) +
+    scale_color_manual(values = col_map,
+                       labels = c("NS", sprintf("Down (%d)", n_down), sprintf("Up (%d)", n_up))) +
+    labs(title = titles[[n]], x = "log2 fold change", y = "-log10(padj)", color = NULL) +
+    theme_pub
+  ggsave(file.path(OUT_DIR, sprintf("figures/Volcano_%s.png", n)), p_v, width = 4.5, height = 4, dpi = 300)
+}
+
+
+## -----------------------------------------------------------------
+## 7. VENN DIAGRAMS & EXPORT OF COMMON DEGS
+## -----------------------------------------------------------------
+sig_set <- function(name) {
+  f <- file.path(OUT_DIR, sprintf("results/DEG_%s_sig.csv", name))
+  if (file.exists(f)) rownames(read.csv(f, row.names = 1)) else character(0)
+}
+
+export_gene_list <- function(gene_vector, filename, description) {
+  if (length(gene_vector) == 0) {
+    df <- data.frame(gene_id = character(0), category = character(0), stringsAsFactors = FALSE)
+    cat(sprintf("[Notice] %-45s: 0 genes (empty set)\n", filename))
+  } else {
+    df <- data.frame(gene_id = gene_vector, category = rep(description, length(gene_vector)), stringsAsFactors = FALSE)
+    cat(sprintf("[Exported] %-45s: %d genes\n", filename, length(gene_vector)))
+  }
+  write.csv(df, file.path(OUT_DIR, sprintf("results/%s", filename)), row.names = FALSE)
+}
+
+# --- A. Within Resistant Comparisons (3-Way) ---
+r_a <- sig_set("R_SCN_5vs30")
+r_b <- sig_set("R_SCNvsSCN+SBA_30")
+r_c <- sig_set("R_SCN+SBA_5vs30")
+
+if (length(r_a) > 0 || length(r_b) > 0 || length(r_c) > 0) {
+  venn_r <- venn.diagram(
+    x        = list(
+      "R: SCN 5 vs 30dpi"       = r_a,
+      "R: SCN vs SCN+SBA 30dpi" = r_b,
+      "R: SCN+SBA 5 vs 30 dpi"  = r_c
+    ),
+    filename = NULL,
+    fill     = c("#66c2a5", "#fc8d62", "#8da0cb"),
+    alpha    = 0.6,
+    cex      = 1.1,
+    cat.cex  = 0.95,
+    margin   = 0.06,
+    scaled   = FALSE,
+    cat.pos  = c(-35, 35, 180),
+    cat.dist = c(0.08, 0.09, 0.05),
+    main     = sprintf("DEGs Overlap within Resistant Comparisons\n(padj<%g, |log2FC|>%g)", PADJ_T, LFC_T),
+    main.cex = 1.05
+  )
+  png(file.path(OUT_DIR, "figures/Venn_Resistant_comparisons.png"), width = 2000, height = 1800, res = 300)
+  grid::grid.draw(venn_r)
+  dev.off()
+}
+
+r_common_all <- Reduce(intersect, list(r_a, r_b, r_c))
+export_gene_list(r_common_all, "common_DEGs_within_Resistant_all3.csv", "Common across R_SCN_5v30, R_SCNvsSCN+SBA_30, R_SCN+SBA_5v30")
+export_gene_list(intersect(r_a, r_b), "common_DEGs_R_SCN_5v30_AND_R_SBA_30d.csv", "Shared: R_SCN_5v30 & R_SCNvsSCN+SBA_30")
+export_gene_list(intersect(r_b, r_c), "common_DEGs_R_SBA_30d_AND_R_SCN+SBA_5v30.csv", "Shared: R_SCNvsSCN+SBA_30 & R_SCN+SBA_5v30")
+export_gene_list(intersect(r_a, r_c), "common_DEGs_R_SCN_5v30_AND_R_SCN+SBA_5v30.csv", "Shared: R_SCN_5v30 & R_SCN+SBA_5v30")
+
+# --- B. R vs S: SCN Treated (5 vs 30 dpi) ---
+rvs_scn_5  <- sig_set("RvsS_SCN_5dpi")
+rvs_scn_30 <- sig_set("RvsS_SCN_30dpi")
+
+if (length(rvs_scn_5) > 0 || length(rvs_scn_30) > 0) {
+  venn_rvs_scn <- venn.diagram(
+    x        = list("R vs S: SCN 5 dpi" = rvs_scn_5, "R vs S: SCN 30 dpi" = rvs_scn_30),
+    filename = NULL,
+    fill     = c("#f4a582", "#67001f"),
+    alpha    = 0.6,
+    cex      = 1.1,
+    cat.cex  = 0.95,
+    margin   = 0.1,
+    scaled   = FALSE,
+    euler.d   = FALSE,                  # Forces standard overlapping Venn layout
+    cat.pos  = c(0, 0),
+    cat.dist = c(0.02, 0.02),
+    main      = sprintf("Overlap of R vs S (SCN) DEGs: 5 vs 30 dpi\n(padj<%g, |log2FC|>%g)", PADJ_T, LFC_T),
+    main.cex = 1.05,
+    main.pos  = c(0.5, 0.86)            # Lowers title closer to circles
+  )
+  png(file.path(OUT_DIR, "figures/Venn_RvsS_SCN_5_vs_30dpi.png"), width = 2000, height = 1800, res = 300)
+  grid::grid.draw(venn_rvs_scn)
+  dev.off()
+}
+
+rvs_scn_common <- intersect(rvs_scn_5, rvs_scn_30)
+export_gene_list(rvs_scn_common, "common_DEGs_RvsS_SCN_5dpi_and_30dpi.csv", "Common R vs S DEGs under SCN at both 5 and 30 dpi")
+export_gene_list(setdiff(rvs_scn_5, rvs_scn_30), "unique_DEGs_RvsS_SCN_5dpi_only.csv", "Unique R vs S DEGs under SCN at 5 dpi")
+export_gene_list(setdiff(rvs_scn_30, rvs_scn_5), "unique_DEGs_RvsS_SCN_30dpi_only.csv", "Unique R vs S DEGs under SCN at 30 dpi")
+
+# --- C. R vs S: SCN+SBA Treated (5 vs 30 dpi) ---
+rvs_sba_5  <- sig_set("RvsS_SCN+SBA_5dpi")
+rvs_sba_30 <- sig_set("RvsS_SCN+SBA_30dpi")
+
+if (length(rvs_sba_5) > 0 || length(rvs_sba_30) > 0) {
+  venn_rvs_sba <- venn.diagram(
+    x        = list("R vs S: SCN+SBA 5 dpi" = rvs_sba_5, "R vs S: SCN+SBA 30 dpi" = rvs_sba_30),
+    filename = NULL,
+    fill     = c("#74add1", "#313695"),
+    alpha    = 0.6,
+    cex      = 1.2,
+    cat.cex  = 1.0,
+    margin   = 0.1,
+    scaled   = FALSE,
+    cat.pos  = c(0, 0),
+    cat.dist = c(0.02, 0.02),
+    main      = sprintf("Overlap of R vs S (SCN+SBA) DEGs: 5 vs 30 dpi\n(padj<%g, |log2FC|>%g)", PADJ_T, LFC_T),
+    main.cex = 1.05,
+    main.pos  = c(0.5, 0.86)            # Lowers title closer to circles
+  )
+  png(file.path(OUT_DIR, "figures/Venn_RvsS_SCN+SBA_5_vs_30dpi.png"), width = 2000, height = 1600, res = 300)
+  grid::grid.draw(venn_rvs_sba)
+  dev.off()
+}
+
+rvs_sba_common <- intersect(rvs_sba_5, rvs_sba_30)
+export_gene_list(rvs_sba_common, "common_DEGs_RvsS_SCN+SBA_5dpi_and_30dpi.csv", "Common R vs S DEGs under SCN+SBA at both 5 and 30 dpi")
+
+# --- D. 4-Way Venn: R vs S Across Treatments & Timepoints ---
+if (all(c(length(rvs_scn_5), length(rvs_scn_30), length(rvs_sba_5), length(rvs_sba_30)) > 0)) {
+  venn_rvs_4way <- venn.diagram(
+    x        = list("SCN 5 dpi" = rvs_scn_5, "SCN 30 dpi" = rvs_scn_30, "SCN+SBA 5 dpi" = rvs_sba_5, "SCN+SBA 30 dpi" = rvs_sba_30),
+    filename = NULL,
+    fill     = c("#66c2a5", "#fc8d62", "#8da0cb", "#e78ac3"),
+    alpha    = 0.5,
+    cex      = 1.0,
+    cat.cex  = 0.9,
+    margin   = 0.01,
+    main     = sprintf("Overlap of R vs S DEGs across Treatments & Timepoints\n(padj<%g, |log2FC|>%g)", PADJ_T, LFC_T),
+    main.cex = 1.0
+  )
+  png(file.path(OUT_DIR, "figures/Venn_RvsS_4way_all_treatments.png"), width = 2200, height = 1900, res = 300)
+  grid::grid.draw(venn_rvs_4way)
+  dev.off()
+  
+  core_rvs_genes <- Reduce(intersect, list(rvs_scn_5, rvs_scn_30, rvs_sba_5, rvs_sba_30))
+  export_gene_list(core_rvs_genes, "common_DEGs_RvsS_core_all_4_comparisons.csv", "Core R vs S genes across SCN and SCN+SBA at 5 and 30 dpi")
+}
+
+# --- E. Detailed Expression Metrics for Common SCN Genes ---
+if (length(rvs_scn_common) > 0) {
+  f5  <- read.csv(file.path(OUT_DIR, "results/DEG_RvsS_SCN_5dpi_full.csv"), row.names = 1)
+  f30 <- read.csv(file.path(OUT_DIR, "results/DEG_RvsS_SCN_30dpi_full.csv"), row.names = 1)
+  
+  detailed_common_scn <- data.frame(
+    gene_id          = rvs_scn_common,
+    log2FC_SCN_5dpi  = f5[rvs_scn_common, "log2FoldChange"],
+    padj_SCN_5dpi    = f5[rvs_scn_common, "padj"],
+    log2FC_SCN_30dpi = f30[rvs_scn_common, "log2FoldChange"],
+    padj_SCN_30dpi   = f30[rvs_scn_common, "padj"],
+    stringsAsFactors = FALSE
+  )
+  detailed_common_scn <- detailed_common_scn[order(abs(detailed_common_scn$log2FC_SCN_30dpi), decreasing = TRUE), ]
+  write.csv(detailed_common_scn, file.path(OUT_DIR, "results/detailed_common_DEGs_RvsS_SCN_5_and_30dpi.csv"), row.names = FALSE)
+}
+
+sink(file.path(OUT_DIR, "figures/venn_gene_lists.txt"))
+cat("=== Within Resistant Comparisons ===\n")
+cat("R_SCN_5vs30 only:", length(setdiff(r_a, union(r_b, r_c))), "\n")
+cat("R_SCNvsSCN+SBA_30 only:", length(setdiff(r_b, union(r_a, r_c))), "\n")
+cat("R_SCN+SBA_5vs30 only:", length(setdiff(r_c, union(r_a, r_b))), "\n")
+cat("Common across all 3 Resistant comparisons:", length(r_common_all), "\n\n")
+
+cat("=== R vs S (SCN) 5 dpi vs 30 dpi ===\n")
+cat("5 dpi only:", length(setdiff(rvs_scn_5, rvs_scn_30)), "\n")
+cat("30 dpi only:", length(setdiff(rvs_scn_30, rvs_scn_5)), "\n")
+cat("Shared (5 & 30 dpi):", length(rvs_scn_common), "\n\n")
+
+cat("=== R vs S (SCN+SBA) 5 dpi vs 30 dpi ===\n")
+cat("5 dpi only:", length(setdiff(rvs_sba_5, rvs_sba_30)), "\n")
+cat("30 dpi only:", length(setdiff(rvs_sba_30, rvs_sba_5)), "\n")
+cat("Shared (5 & 30 dpi):", length(rvs_sba_common), "\n")
+sink()
+
+## -----------------------------------------------------------------
+## 8. VST TRANSFORM & NATIVE HEATMAPS RENDERING
+## -----------------------------------------------------------------
+vsd <- vst(dds, blind = FALSE)
+vst_mat <- assay(vsd)
+write.csv(vst_mat, file.path(OUT_DIR, "results/vst_full.csv"))
+
+meta_hm <- as.data.frame(colData(dds))[, c("genotype", "treatment", "days")]
+ann_colors <- list(
+  genotype  = c(R = "#e41a1c", S = "#377eb8"),
+  treatment = c(Cntrl = "#4daf4a", SCN = "#ff7f00", `SCN+SBA` = "#984ea3"),
+  days      = c(`5` = "#f4a582", `30` = "#67001f")
+)
+
+# Native pheatmap file output.
+draw_heatmap <- function(genes, samples, title, fname, w = 8.5, h = 11.2, show_rownames = TRUE) {
+  genes <- intersect(genes, rownames(vst_mat))
+  if (length(genes) < 2) return(NULL)
+  
+  mat <- vst_mat[genes, samples, drop = FALSE]
+  mat_z <- t(scale(t(mat)))
+  
+  out_file <- file.path(OUT_DIR, sprintf("figures/%s.png", fname))
+  
+  pheatmap(
+    mat_z,
+    color             = colorRampPalette(rev(brewer.pal(9, "RdBu")))(100),
+    annotation_col    = meta_hm[samples, , drop = FALSE],
+    annotation_colors = ann_colors,
+    show_rownames     = show_rownames,
+    fontsize_row      = 6.5,
+    fontsize_col      = 8,
+    treeheight_row    = 35,       # Keeps left dendrogram compact and within margins
+    treeheight_col    = 30,       # Balances column dendrogram height
+    main              = title,
+    filename          = out_file, # Native direct-to-file graphics pipeline
+    width             = w,        # Inches
+    height            = h         # Inches
+  )
+  cat(sprintf("[Heatmap Saved] %s (%.1f x %.1f in)\n", basename(out_file), w, h))
+}
+
+# 1. Heatmap: Significant DEGs union across pairwise comparisons (35 samples, no rownames)
+names_wg <- c("S_SCN_5vs30", "S_SCNvsSCN+SBA_5", "S_SCNvsSCN+SBA_30", "S_SCN+SBA_5vs30",
+              "R_SCN_5vs30", "R_SCNvsSCN+SBA_5", "R_SCNvsSCN+SBA_30", "R_SCN+SBA_5vs30")
+union_genes <- unique(unlist(lapply(names_wg, sig_set)))
+
+if (length(union_genes) >= 2) {
+  draw_heatmap(
+    union_genes,
+    colnames(vst_mat),
+    sprintf("Significant DEGs across genotype comparisons (n=%d)", length(union_genes)),
+    "Heatmap_significant_DEGs_across_genotype",
+    w = 10.5, h = 12.5, show_rownames = FALSE
+  )
+}
+
+# 2. Heatmap: Top 100 DEGs - SCN effect over time in Resistant cultivar (17 samples)
+res_scn_time <- file.path(OUT_DIR, "results/DEG_R_SCN_5vs30_sig.csv")
+if (file.exists(res_scn_time)) {
+  res_scn <- read.csv(res_scn_time, row.names = 1)
+  res_scn <- res_scn[order(res_scn$padj), ]
+  r_samples <- rownames(meta_hm)[meta_hm$genotype == "R"]
+  draw_heatmap(
+    rownames(res_scn)[1:min(100, nrow(res_scn))],
+    r_samples,
+    "Top 100 DEGs: SCN effect over time (Resistant genotype)",
+    "Heatmap_R_SCN_time_top100",
+    w = 8.2, h = 11.2, show_rownames = TRUE
+  )
+}
+
+# 3. Heatmap: Top 100 DEGs - SCN+SBA effect over time in Resistant cultivar (17 samples)
+res_sba_time <- file.path(OUT_DIR, "results/DEG_R_SCN+SBA_5vs30_sig.csv")
+if (file.exists(res_sba_time)) {
+  res_sba <- read.csv(res_sba_time, row.names = 1)
+  res_sba <- res_sba[order(res_sba$padj), ]
+  r_samples <- rownames(meta_hm)[meta_hm$genotype == "R"]
+  draw_heatmap(
+    rownames(res_sba)[1:min(100, nrow(res_sba))],
+    r_samples,
+    "Top 100 DEGs: SCN+SBA effect over time (Resistant genotype)",
+    "Heatmap_R_SCN+SBA_time_top100",
+    w = 8.2, h = 11.2, show_rownames = TRUE
+  )
+}
+
+# 4. Heatmap: Top 100 DEGs - R vs S (SCN at 30 dpi, 35 samples)
+res_r_vs_s_30 <- file.path(OUT_DIR, "results/DEG_RvsS_SCN_30dpi_sig.csv")
+if (file.exists(res_r_vs_s_30)) {
+  res_rvs30 <- read.csv(res_r_vs_s_30, row.names = 1)
+  res_rvs30 <- res_rvs30[order(res_rvs30$padj), ]
+  draw_heatmap(
+    rownames(res_rvs30)[1:min(100, nrow(res_rvs30))],
+    colnames(vst_mat),
+    "Top 100 DEGs: Resistant vs Susceptible (SCN 30 dpi)",
+    "Heatmap_RvsS_SCN_30dpi_top100",
+    w = 10.0, h = 11.5, show_rownames = TRUE
+  )
+}
+
+# 5. Heatmap: Common R vs S genes across 5 & 30 dpi (SCN)
+if (length(rvs_scn_common) >= 2) {
+  draw_heatmap(
+    rvs_scn_common,
+    colnames(vst_mat),
+    sprintf("Common R vs S DEGs in SCN at 5 & 30 dpi (n=%d)", length(rvs_scn_common)),
+    "Heatmap_Common_RvsS_SCN_5_and_30dpi",
+    w = 10.0, h = 11.5, show_rownames = ifelse(length(rvs_scn_common) <= 60, TRUE, FALSE)
+  )
+}
+
+## -----------------------------------------------------------------
+## 9. PCA & QC PLOTS (CONTROLS EXCLUDED FROM COMPLEXITY BOXPLOT)
+## -----------------------------------------------------------------
+# PCA across all samples
+rv <- rowVars(assay(vsd))
+top_n <- min(2000, length(rv))
+top_var_genes <- order(rv, decreasing = TRUE)[1:top_n]
+pca <- prcomp(t(assay(vsd)[top_var_genes, ]), center = TRUE, scale. = FALSE)
+pve <- round(100 * pca$sdev^2 / sum(pca$sdev^2), 1)
+
+pcdf <- as.data.frame(pca$x[, 1:2]) %>%
+  mutate(sample = rownames(.)) %>%
+  bind_cols(meta_hm[rownames(.), c("genotype", "treatment", "days")])
+
+p_pca <- ggplot(pcdf, aes(PC1, PC2, color = treatment, shape = genotype)) +
+  geom_point(size = 3.5, stroke = 0.8) +
+  scale_color_manual(values = c(Cntrl = "#4daf4a", SCN = "#ff7f00", `SCN+SBA` = "#984ea3")) +
+  labs(title = sprintf("PCA of VST-transformed expression (top %d variable genes)", top_n),
+       x     = sprintf("PC1 (%.1f%% var)", pve[1]),
+       y     = sprintf("PC2 (%.1f%% var)", pve[2])) +
+  theme_bw(base_size = 11) + 
+  theme(panel.grid.minor = element_blank())
+ggsave(file.path(OUT_DIR, "figures/PCA_all_samples.png"), p_pca, width = 6.5, height = 5.5, dpi = 300)
+
+# Library Complexity QC Boxplot: Exclude Cntrl samples
+raw_counts <- counts(dds)
+qc <- data.frame(
+  sample         = colnames(raw_counts),
+  total_counts   = colSums(raw_counts),
+  genes_detected = colSums(raw_counts > 10)
+) %>%
+  left_join(meta %>% mutate(sample = rownames(.)), by = "sample") %>%
+  filter(treatment != "Cntrl")
+
+p1 <- ggplot(qc, aes(x = genotype, y = total_counts, fill = days)) +
+  geom_boxplot(outlier.size = 1) + scale_y_log10() +
+  scale_fill_manual(values = c(`5` = "#f4a582", `30` = "#67001f")) +
+  labs(title = "Total Counts per Sample", y = "Total Gene Counts") + 
+  theme_bw(base_size = 11)
+
+p2 <- ggplot(qc, aes(x = genotype, y = genes_detected, fill = days)) +
+  geom_boxplot(outlier.size = 1) +
+  scale_fill_manual(values = c(`5` = "#f4a582", `30` = "#67001f")) +
+  labs(title = "Genes Detected per Sample", y = "Detected Genes (count > 10)") + 
+  theme_bw(base_size = 11)
+
+g <- arrangeGrob(p1, p2, ncol = 2)
+ggsave(file.path(OUT_DIR, "figures/QC_library_complexity.png"), g, width = 10, height = 4.5, dpi = 300)
+
+cat("\nAnalysis complete. Figures and result tables updated in results/ and figures/.\n")
+******************************************************************************************
+
+6. Protein sequence extraction from fasta file, using significantly expressed gene names
+
+(R)
+library(Biostrings)
+
+BASE_DIR <- "/path/to/file"
+OUT_DIR  <- file.path(getwd(), "results")
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# 1. Load protein FASTA
+fasta_candidates <- list.files(
+  BASE_DIR,
+  pattern     = "protein.*(\\.(fa|faa|fasta)(\\.gz)?)?$",
+  recursive   = TRUE,
+  full.names  = TRUE,
+  ignore.case = TRUE
+)
+
+if (length(fasta_candidates) == 0) {
+  stop("Protein FASTA file could not be located under: ", BASE_DIR)
+}
+
+fasta_in <- fasta_candidates[1]
+proteins <- readAAStringSet(fasta_in)
+cat(sprintf("Loaded FASTA with %d protein sequences.\n", length(proteins)))
+
+# 2. Prepare multiple cleaned versions of FASTA headers for matching
+raw_headers     <- names(proteins)
+first_word_ids  <- sub("^([^ \t|]+).*", "\\1", raw_headers)
+gene_ids_no_ver <- sub("\\.[0-9]+$", "", first_word_ids)
+
+# Extract gene=... or transcript=... if stored inside description lines
+wb_gene_ids <- ifelse(grepl("gene=", raw_headers),
+                      sub(".*gene=([^ \t;]+).*", "\\1", raw_headers),
+                      NA)
+
+# 3. Locate all significant DEG CSV files
+csv_files <- list.files(OUT_DIR, pattern = "^DEG_.*_sig\\.csv$", full.names = TRUE)
+
+if (length(csv_files) == 0) {
+  # Search entire working directory if not located directly in OUT_DIR
+  csv_files <- list.files(".", pattern = "^DEG_.*_sig\\.csv$", recursive = TRUE, full.names = TRUE)
+}
+
+cat(sprintf("Processing %d DEG CSV files...\n\n", length(csv_files)))
+
+# 4. Extract sequences for each DEG CSV
+for (csv_file in csv_files) {
+  deg_df <- read.csv(csv_file, row.names = 1)
+  deg_genes <- unique(rownames(deg_df))
+  
+  if (length(deg_genes) == 0) {
+    cat(sprintf("[Skipped] %-35s (0 DEGs in file)\n", basename(csv_file)))
+    next
+  }
+  
+  # Check across all header variations
+  matched_idx <- which(
+    raw_headers %in% deg_genes |
+      first_word_ids %in% deg_genes |
+      gene_ids_no_ver %in% deg_genes |
+      wb_gene_ids %in% deg_genes
+  )
+  
+  comp_name <- sub("^DEG_(.*)_sig\\.csv$", "\\1", basename(csv_file))
+  out_fasta <- file.path(OUT_DIR, sprintf("Proteins_%s.fasta", comp_name))
+  
+  if (length(matched_idx) > 0) {
+    writeXStringSet(proteins[matched_idx], filepath = out_fasta, format = "fasta")
+    cat(sprintf("[Extracted] %-35s -> %d sequences written to %s\n",
+                basename(csv_file), length(matched_idx), basename(out_fasta)))
+  } else {
+    cat(sprintf("[Failed]    %-35s -> 0 / %d DEGs matched in FASTA\n",
+                basename(csv_file), length(deg_genes)))
+  }
+}
+
+# 5. List created files
+created_fastas <- list.files(OUT_DIR, pattern = "\\.fasta$", full.names = TRUE)
+cat(sprintf("\nSuccessfully created %d FASTA file(s) in: %s\n", length(created_fastas), OUT_DIR))
+******************************************************************************************
+
+7. Functional annotation of differentially expressed protein sequences using eggNOG-mapper v3
+
+(bash)
+emapper.py -i Proteins_R_SCN+SBA_5vs30.fasta -o query --cpu 10 --itype proteins -m diamond --dmnd_sensmode sensitive --dmnd_iterate yes --dmnd_block_size 2 --dmnd_index_chunks 4 --tax_scope auto --evalue 0.001 --annot_evalue 0.001 --target_orthologs all --donor_pool closest --report_orthologs --md5 –excel
+******************************************************************************************
+
